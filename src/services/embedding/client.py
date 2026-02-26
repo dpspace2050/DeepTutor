@@ -88,10 +88,8 @@ class EmbeddingClient:
                 all_embeddings.extend(response.embeddings)
 
             self.logger.debug(
-                "Generated %d embeddings using %s (batch_size=%d)",
-                len(all_embeddings),
-                self.config.binding,
-                batch_size,
+                f"Generated {len(all_embeddings)} embeddings using "
+                f"{self.config.binding} (batch_size={batch_size})"
             )
             return all_embeddings
         except Exception as e:
