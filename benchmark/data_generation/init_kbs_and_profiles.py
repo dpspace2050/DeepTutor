@@ -20,7 +20,6 @@ import os
 import re
 import shutil
 import sys
-from subprocess import DEVNULL
 from datetime import datetime
 from pathlib import Path
 
@@ -53,26 +52,12 @@ def _runtime_status(message: str) -> None:
     print(message, flush=True)
 
 
-def _configure_logging(verbose_info: bool) -> None:
-    """Configure logging verbosity."""
-    level = logging.INFO if verbose_info else logging.WARNING
+def _configure_logging() -> None:
+    """Configure default logging (INFO)."""
     logging.basicConfig(
-        level=level,
+        level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    if not verbose_info:
-        noisy = [
-            "src",
-            "benchmark",
-            "httpx",
-            "httpcore",
-            "openai",
-            "lightrag",
-            "nano-vectordb",
-            "asyncio",
-        ]
-        for name in noisy:
-            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _sanitize_kb_name(name: str) -> str:
@@ -316,9 +301,7 @@ async def _run_jobs_with_gpu_pipeline(
         _runtime_status(
             f"[GPU {gpu_id}] running {pdf_path.name} | queue remaining: {remaining_after_dispatch}"
         )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, env=env, stdout=DEVNULL, stderr=DEVNULL
-        )
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
         wait_task = asyncio.create_task(proc.wait())
         return {
             "pdf_path": pdf_path,
@@ -450,11 +433,6 @@ async def main() -> None:
         help='MinerU API model version (default: "vlm").',
     )
     parser.add_argument(
-        "--verbose-info",
-        action="store_true",
-        help="Enable INFO logs (disable quiet mode).",
-    )
-    parser.add_argument(
         "--gpu-ids",
         default="0,1,2,3",
         help='GPU ids for sharding workloads, comma-separated (default: "0,1,2,3").',
@@ -463,7 +441,7 @@ async def main() -> None:
     parser.add_argument("--single-kb-name", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    _configure_logging(verbose_info=args.verbose_info)
+    _configure_logging()
 
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
