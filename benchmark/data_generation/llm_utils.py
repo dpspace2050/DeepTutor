@@ -21,6 +21,58 @@ logger = logging.getLogger("benchmark.llm_utils")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _normalize_json_like_text(text: str) -> str:
+    """Normalize common LLM artifacts before JSON parsing."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.replace("\ufeff", "").replace("\x00", "").strip()
+    # Normalize smart quotes that occasionally appear in model outputs.
+    text = (
+        text.replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+        .replace("‘", "'")
+    )
+    return text
+
+
+def _cleanup_json_candidate(candidate: str) -> str:
+    """Best-effort cleanup for a JSON substring candidate."""
+    s = _normalize_json_like_text(candidate)
+    # If a fence label leaked into content, strip it.
+    if s.lower().startswith("json"):
+        s = s[4:].lstrip()
+    # Remove trailing commas before object/array close.
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return s
+
+
+def _yield_json_candidates(text: str):
+    """Yield likely JSON substrings from noisy LLM output."""
+    t = _normalize_json_like_text(text)
+    if not t:
+        return
+
+    # Candidate 1: full response
+    yield t
+
+    # Candidate 2: fenced code blocks (prefer explicit json fences)
+    for m in re.finditer(r"```json\s*(.*?)\s*```", t, re.DOTALL | re.IGNORECASE):
+        yield m.group(1)
+    for m in re.finditer(r"```(.*?)```", t, re.DOTALL):
+        yield m.group(1)
+
+    # Candidate 3: streaming scan with JSONDecoder from each possible start.
+    decoder = json.JSONDecoder()
+    starts = [i for i, ch in enumerate(t) if ch in "{["]
+    for idx in starts:
+        try:
+            _, end = decoder.raw_decode(t, idx)
+            yield t[idx:end]
+        except Exception:
+            continue
+
+
 def load_prompt(prompt_name: str) -> dict:
     """
     Load a prompt template from benchmark/prompts/.
@@ -119,33 +171,36 @@ def extract_json(text: str) -> dict:
     Returns:
         Parsed JSON dictionary
     """
-    text = text.strip()
+    normalized = _normalize_json_like_text(text)
+    if not normalized:
+        raise json.JSONDecodeError("Empty LLM response, no JSON to parse", text, 0)
 
-    # Strategy 1: Direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Strategy 2: Extract from markdown code fences
-    json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if json_match:
+    last_error: Exception | None = None
+    for candidate in _yield_json_candidates(normalized):
+        cleaned = _cleanup_json_candidate(candidate)
+        if not cleaned:
+            continue
         try:
-            return json.loads(json_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+            parsed = json.loads(cleaned)
+        except Exception as e:
+            last_error = e
+            continue
 
-    # Strategy 3: Find outermost JSON object
-    # Find the first '{' and the last '}'
-    first_brace = text.find("{")
-    last_brace = text.rfind("}")
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        try:
-            return json.loads(text[first_brace : last_brace + 1])
-        except json.JSONDecodeError:
-            pass
+        if isinstance(parsed, dict):
+            return parsed
+        # Tolerate list-wrapped single object: [{...}]
+        if (
+            isinstance(parsed, list)
+            and len(parsed) == 1
+            and isinstance(parsed[0], dict)
+        ):
+            return parsed[0]
 
-    raise json.JSONDecodeError("Cannot extract JSON from LLM response", text, 0)
+    preview = normalized[:240].replace("\n", "\\n")
+    msg = f"Cannot extract JSON from LLM response (preview='{preview}')"
+    if isinstance(last_error, json.JSONDecodeError):
+        raise json.JSONDecodeError(msg, normalized, last_error.pos)
+    raise json.JSONDecodeError(msg, normalized, 0)
 
 
 def render_prompt(template: str, **kwargs) -> str:
