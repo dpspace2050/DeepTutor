@@ -148,6 +148,7 @@ async def _process_one_kb(
                 mode=rag_cfg.get("mode", "naive"),
                 kb_base_dir=str(kb_base_dir),
             )
+            kb_entry_root.mkdir(parents=True, exist_ok=True)
             with open(kb_entry_root / "knowledge_scope.json", "w", encoding="utf-8") as f:
                 json.dump(scope, f, ensure_ascii=False, indent=2)
         except Exception as e:
