@@ -70,6 +70,18 @@ async def _simulate_profile_backend(
         _summarize_session,
     )
 
+    if not entries:
+        logger.warning("[%s/%s] %s has 0 entries, skipping", kb_name, backend, profile_id)
+        return {
+            "status": "skipped",
+            "backend": backend,
+            "profile_id": profile_id,
+            "kb_name": kb_name,
+            "num_sessions": 0,
+            "transcript_path": "",
+            "error": "0 entries",
+        }
+
     workspace = str(output_root / "workspaces" / kb_name / backend / profile_id)
     prior_sessions_summary: list[str] = []
     current_profile = entries[0].get("profile", {})
@@ -317,6 +329,17 @@ async def main() -> None:
                         "error": f"Failed to load entries.jsonl: {e}",
                     }
                 )
+                continue
+            if not entries:
+                pre_errors.append(
+                    {
+                        "kb_name": kb_name,
+                        "profile_id": profile_id,
+                        "status": "error",
+                        "error": f"entries.jsonl is empty (0 entries): {entries_path}",
+                    }
+                )
+                logger.error("[%s] %s has 0 entries, skipping", kb_name, profile_id)
                 continue
             tasks.append(
                 _process_profile(
