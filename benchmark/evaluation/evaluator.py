@@ -574,8 +574,31 @@ async def _eval_pq_per_question(
             "Scoring guide:\n"
             "- difficulty_fit_delta: -5 = much too easy for this student, "
             "+5 = much too hard, 0 = ideal fit.\n"
-            "- groundedness (1-5): Is the question grounded in the provided source content? "
-            "5 = directly derived from source material; 1 = fabricated or unrelated to source.\n"
+            "- groundedness (1-5): Are the question's claims, terminology, and "
+            "correct answer consistent with the source content? "
+            "Check THREE aspects:\n"
+            "  (a) Factual consistency: do factual claims align with and not "
+            "contradict the source?\n"
+            "  (b) Terminological consistency: does the question use the same "
+            "definitions, terminology, and framing as the source? Different "
+            "textbooks may define concepts differently; the question should follow "
+            "the source's conventions, not introduce alternative definitions.\n"
+            "  (c) Source grounding: does the question draw on specific details, "
+            "examples, or structures from the source material? A question that "
+            "references concrete content from the source (even paraphrased) is "
+            "better grounded than one based on generic knowledge alone.\n"
+            "A question that goes beyond the source (e.g. applies concepts to new "
+            "scenarios) is fine as long as it doesn't distort or contradict the source. "
+            "5 = all claims are accurate, terminology matches, AND the question "
+            "clearly draws on specific source content; "
+            "4 = mostly consistent, some evidence of source grounding, minor "
+            "imprecision in wording; "
+            "3 = some claims or definitions deviate from the source, or the question "
+            "appears largely generic with weak connection to source material; "
+            "2 = multiple claims contradict the source, or key terms use different "
+            "definitions, or no evidence of consulting the source; "
+            "1 = core claims are wrong or hallucinated, or terminology directly "
+            "conflicts with the source's definitions.\n"
             "- distractor_quality (1-5): Quality of wrong answer options. "
             "5 = distractors target common misconceptions, are plausible but clearly wrong; "
             "1 = distractors are obviously absurd or trivially eliminable. "
@@ -915,6 +938,13 @@ def _aggregate_multi_session(session_results: list[dict]) -> dict:
                 if isinstance(v, (int, float)):
                     lst.append(float(v))
 
+    total_resolved = sum(resolved_counts)
+    total_gaps = sum(total_gaps_counts)
+    gap_resolution_rate = round(total_resolved / total_gaps, 3) if total_gaps else None
+    gap_efficiency = (
+        round(total_resolved / total_paired_turns, 3) if total_paired_turns else None
+    )
+
     result: dict = {
         "turn_count": {
             "student_turns_total": total_student_turns,
@@ -924,6 +954,10 @@ def _aggregate_multi_session(session_results: list[dict]) -> dict:
         "gap_tracking": {
             "resolved_gaps_per_session": resolved_counts,
             "total_gaps_per_session": total_gaps_counts,
+            "total_resolved": total_resolved,
+            "total_gaps": total_gaps,
+            "gap_resolution_rate": gap_resolution_rate,
+            "gap_resolution_efficiency": gap_efficiency,
         },
         "source_faithfulness": {
             "scale": "1-5",

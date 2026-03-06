@@ -288,6 +288,20 @@ async def deep_tutor_generate_practice_problem(
     return _format_question_block(questions[0])
 
 
+def _build_practice_preferences(
+    tutor_history: list[dict[str, str]],
+) -> str:
+    """Build a preferences string from conversation history."""
+    if not tutor_history:
+        return ""
+    convo_lines = []
+    for msg in tutor_history[-16:]:
+        role = "Student" if msg.get("role") == "user" else "Tutor"
+        text = (msg.get("content", "") or "")[:300]
+        convo_lines.append(f"[{role}] {text}")
+    return "Recent conversation:\n" + "\n".join(convo_lines)
+
+
 async def deep_tutor_generate_practice_questions(
     *,
     kb_name: str,
@@ -295,24 +309,49 @@ async def deep_tutor_generate_practice_questions(
     topic: str,
     language: str = "en",
     num_questions: int = PRACTICE_QUESTION_COUNT,
+    max_retries: int = 2,
+    tutor_history: list[dict[str, str]] | None = None,
 ) -> list[str]:
-    """Generate multiple practice questions via DeepTutor question pipeline."""
+    """Generate multiple practice questions via DeepTutor question pipeline.
+
+    If fewer than num_questions are returned, retries with the remaining count.
+    """
     from benchmark.simulation.tools import generate_questions
 
     if not kb_name:
         return ["(Practice question generation unavailable: missing kb_name in entry.)"]
 
-    result = await generate_questions(
-        workspace=workspace,
-        kb_name=kb_name,
-        topic=topic,
-        num_questions=num_questions,
-        language=language,
-        enable_web=False,
-    )
-    questions = result.get("questions", []) or []
-    formatted = [_format_question_block(q) for q in questions if q]
-    return formatted or ["(Practice question generation failed.)"]
+    preferences = _build_practice_preferences(tutor_history or [])
+    formatted: list[str] = []
+    remaining = num_questions
+
+    for attempt in range(1 + max_retries):
+        if remaining <= 0:
+            break
+        result = await generate_questions(
+            workspace=workspace,
+            kb_name=kb_name,
+            topic=topic,
+            preferences=preferences,
+            num_questions=remaining,
+            language=language,
+            enable_web=False,
+        )
+        questions = result.get("questions", []) or []
+        for q in questions:
+            if q:
+                formatted.append(_format_question_block(q))
+        remaining = num_questions - len(formatted)
+        if remaining <= 0:
+            break
+        logger.warning(
+            "DeepTutor generated %d/%d questions (attempt %d/%d), retrying %d remaining",
+            len(formatted), num_questions, attempt + 1, 1 + max_retries, remaining,
+        )
+
+    if not formatted:
+        return ["(Practice question generation failed.)"]
+    return formatted[:num_questions]
 
 
 def _format_practice_questions_block(questions: list[str]) -> str:
@@ -531,6 +570,7 @@ async def _run_single_session(
                     workspace=workspace,
                     topic=topic,
                     language=deeptutor_language,
+                    tutor_history=tutor_history,
                 )
             else:
                 practice_questions = await mock_tutor_generate_practice_questions(
@@ -720,6 +760,7 @@ async def run_conversation(
                     workspace=workspace,
                     topic=topic,
                     language=deeptutor_language,
+                    tutor_history=tutor_history,
                 )
             else:
                 practice_questions = await mock_tutor_generate_practice_questions(

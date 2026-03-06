@@ -112,6 +112,8 @@ def _build_aggregate_summary(results: list[dict], output_root: Path) -> dict:
             {
                 "num_profiles": 0,
                 "paired_turns_total": 0,
+                "total_resolved": 0,
+                "total_gaps": 0,
                 "faithfulness_scores": [],
                 "insightfulness_scores": [],
                 "applicability_scores": [],
@@ -134,6 +136,9 @@ def _build_aggregate_summary(results: list[dict], output_root: Path) -> dict:
         g["paired_turns_total"] += (
             s.get("turn_count", {}).get("paired_turns_total", 0)
         )
+        gt = s.get("gap_tracking", {})
+        g["total_resolved"] += gt.get("total_resolved", 0)
+        g["total_gaps"] += gt.get("total_gaps", 0)
         faith = s.get("source_faithfulness", {}).get("avg_score_overall")
         if isinstance(faith, (int, float)):
             g["faithfulness_scores"].append(float(faith))
@@ -160,9 +165,16 @@ def _build_aggregate_summary(results: list[dict], output_root: Path) -> dict:
 
     out: dict[str, dict] = {}
     for backend, s in grouped.items():
+        total_res = s["total_resolved"]
+        total_gap = s["total_gaps"]
+        turns = s["paired_turns_total"]
         backend_summary: dict[str, Any] = {
             "num_profiles": s["num_profiles"],
-            "paired_turns_total": s["paired_turns_total"],
+            "paired_turns_total": turns,
+            "total_resolved_gaps": total_res,
+            "total_gaps": total_gap,
+            "gap_resolution_rate": round(total_res / total_gap, 3) if total_gap else None,
+            "gap_resolution_efficiency": round(total_res / turns, 3) if turns else None,
             "avg_faithfulness": _safe_avg(s["faithfulness_scores"]),
             "avg_insightfulness": _safe_avg(s["insightfulness_scores"]),
             "avg_applicability": _safe_avg(s["applicability_scores"]),

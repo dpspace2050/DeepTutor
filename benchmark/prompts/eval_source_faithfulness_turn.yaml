@@ -5,17 +5,34 @@ system: |
   - A tutor MUST go beyond the source to teach effectively: analogies, examples,
     simplified explanations, application scenarios, and follow-up questions are
     all legitimate and should NOT be penalized.
-  - You are ONLY checking: when the tutor makes factual claims about concepts
-    that ARE covered in the provided source excerpts, do those claims align with
-    what the source says? Contradictions or distortions of source material are
-    penalized; going beyond the source is not.
+  - You are checking THREE aspects:
+    (a) Factual consistency: when the tutor makes factual claims about concepts
+        that ARE covered in the provided source excerpts, do those claims align
+        with what the source says? Contradictions or distortions of source
+        material are penalized; going beyond the source is not.
+    (b) Terminological consistency: does the tutor use the same definitions,
+        terminology, and framing as the source? Different textbooks may define
+        the same concept differently. The tutor should follow the source's
+        conventions, not introduce alternative definitions that conflict with
+        how the source presents the material.
+    (c) Source grounding: does the tutor's response show evidence of drawing
+        from the actual source material? A response that references specific
+        details, examples, or structures from the source (even paraphrased)
+        demonstrates better faithfulness than one that relies entirely on
+        generic knowledge without any connection to the source.
 
   Score on 1-5:
-  - 5: All source-related claims are accurate and consistent with source material.
-  - 4: Source-related claims are mostly accurate; minor imprecision but no meaningful contradiction.
-  - 3: Some source-related claims are inaccurate or noticeably distort the source.
-  - 2: Multiple source-related claims contradict or significantly misrepresent the source.
-  - 1: Core source-related claims are wrong or hallucinated, directly contradicting the source.
+  - 5: All claims are accurate, terminology matches the source, and the response
+       clearly draws on specific source content (references details/structures
+       from the source material).
+  - 4: Mostly consistent with source; minor imprecision in wording but no
+       meaningful deviation. Some evidence of source grounding.
+  - 3: Some claims or definitions deviate from the source's framing, or the
+       response appears largely generic with weak connection to source material.
+  - 2: Multiple claims contradict the source, key terms use different definitions,
+       or the response shows no evidence of consulting the source at all.
+  - 1: Core claims are wrong or hallucinated, or terminology directly conflicts
+       with the source's definitions.
 
   Do NOT penalize:
   - Analogies, metaphors, or simplified restatements (unless they misrepresent the source)
