@@ -401,10 +401,10 @@ async def main() -> None:
     )
     parser.add_argument("--no-evolve", action="store_true", help="Disable profile evolution")
     parser.add_argument(
-        "--verbose",
         "-v",
+        "--verbose",
         action="store_true",
-        help="Show per-turn student/tutor dialogue logs",
+        help="Show per-turn student/tutor dialogue logs (newly executed sessions only)",
     )
     parser.add_argument(
         "--force",
@@ -448,7 +448,10 @@ async def main() -> None:
     print(f"KBs: {len(kb_names)} | Concurrency(profile): {args.concurrency}")
     print(f"Backends(parallel/profile): {backends}")
     print(f"Backend concurrency/profile: {args.backend_concurrency}")
+    print(f"Dialogue logs: {'enabled (-v/--verbose)' if args.verbose else 'disabled'}")
     print(f"Resume mode: {'disabled (--force)' if args.force else 'enabled (skip existing entries)'}")
+    if args.verbose and not args.force:
+        print("Note: in resume mode, existing sessions are skipped; dialogue logs are shown only for newly executed sessions.")
     print(f"Output root: {output_root}")
 
     sem = asyncio.Semaphore(args.concurrency)

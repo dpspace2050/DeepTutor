@@ -4,6 +4,7 @@ Quick LLM API smoke test.
 
 Usage:
   python3 src/tools/test_llm_api.py --prompt "Say hello"
+  python3 src/tools/test_llm_api.py --model qwen3.5-plus --show-config
   python3 src/tools/test_llm_api.py --show-config
   python3 src/tools/test_llm_api.py --direct --show-config
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -94,6 +96,11 @@ async def main() -> None:
     parser.add_argument("--system", default="You are a concise helpful assistant.")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override model for this run (takes precedence over env config).",
+    )
     parser.add_argument("--show-config", action="store_true")
     parser.add_argument(
         "--direct",
@@ -102,6 +109,8 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model
     clear_llm_config_cache()
     cfg = get_llm_config()
 

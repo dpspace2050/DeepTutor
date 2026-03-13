@@ -4,6 +4,7 @@ Step 3: Evaluate transcripts for specified KBs.
 
 Only evaluates transcripts that belong to input KB names.
 Missing transcripts are recorded as errors (continue-on-error).
+Supports resume by default: existing evaluation outputs are skipped unless --force.
 
 Input:
   Expected profile set from:
@@ -54,6 +55,7 @@ async def _evaluate_one_transcript(
     output_root: Path,
     temperature: float,
     skip_turns: bool,
+    force: bool,
     semaphore: asyncio.Semaphore,
 ) -> dict:
     async with semaphore:
@@ -68,6 +70,10 @@ async def _evaluate_one_transcript(
             "status": "ok",
             "error": None,
         }
+        if out_path.exists() and not force:
+            record["skipped_existing"] = True
+            logger.info("[%s/%s] %s eval exists, skipped", kb_name, backend, profile_id)
+            return record
         try:
             result = await evaluate_transcript(
                 transcript_path=transcript_path,
@@ -241,7 +247,7 @@ async def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Accepted for compatibility; evaluations are overwritten by default.",
+        help="Force re-evaluation and overwrite existing outputs.",
     )
     args = parser.parse_args()
 
@@ -258,6 +264,9 @@ async def main() -> None:
 
     print(f"KBs: {len(kb_names)} | Backends: {backends}")
     print(f"Concurrency(transcript): {args.concurrency}")
+    print(
+        f"Resume mode: {'disabled (--force)' if args.force else 'enabled (skip existing evaluations)'}"
+    )
     print(f"Output root: {output_root}")
 
     missing_errors: list[dict] = []
@@ -304,6 +313,7 @@ async def main() -> None:
                         output_root=output_root,
                         temperature=args.temperature,
                         skip_turns=args.skip_turns,
+                        force=args.force,
                         semaphore=sem,
                     )
                 )
@@ -313,6 +323,7 @@ async def main() -> None:
 
     eval_results = []
     task_errors = 0
+    skipped_existing = 0
     for r in task_results:
         if isinstance(r, Exception):
             task_errors += 1
@@ -321,6 +332,10 @@ async def main() -> None:
             eval_results.append(r)
             if r.get("status") != "ok":
                 task_errors += 1
+            if r.get("skipped_existing"):
+                skipped_existing += 1
+
+    newly_evaluated = len(eval_results) - skipped_existing
 
     aggregate = _build_aggregate_summary(eval_results, output_root)
     summary_path = manifests_root / "step3_summary.json"
@@ -334,10 +349,12 @@ async def main() -> None:
         "backends": backends,
         "output_root": str(output_root),
         "concurrency_transcript": args.concurrency,
-        "overwrite": True,
+        "overwrite": bool(args.force),
         "missing_errors": missing_errors,
         "results": eval_results,
         "num_evaluated": len(eval_results),
+        "num_skipped_existing": skipped_existing,
+        "num_newly_evaluated": newly_evaluated,
         "num_errors": len(missing_errors) + task_errors,
         "summary_path": str(summary_path),
     }
@@ -348,7 +365,8 @@ async def main() -> None:
     print(f"\nSummary: {summary_path}")
     print(f"Manifest: {manifest_path}")
     print(
-        f"Done. Evaluated: {manifest['num_evaluated']} | "
+        f"Done. Evaluated: {manifest['num_evaluated']} "
+        f"(new: {manifest['num_newly_evaluated']}, skipped: {manifest['num_skipped_existing']}) | "
         f"Errors: {manifest['num_errors']}"
     )
     if manifest["num_errors"] > 0:
