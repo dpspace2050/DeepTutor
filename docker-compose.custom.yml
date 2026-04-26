@@ -1,0 +1,79 @@
+# ============================================
+# DeepTutor Custom Build Compose
+# ============================================
+# 基于 docker-compose.yml，唯一改动：补上第3个卷挂载
+# ./data/tutorbot:/app/data/tutorbot
+#
+# 用法：
+#   构建：  docker compose -f docker-compose.custom.yml build
+#   启动：  docker compose -f docker-compose.custom.yml up -d
+#   重启：  docker compose -f docker-compose.custom.yml down && docker compose -f docker-compose.custom.yml up -d
+# ============================================
+
+services:
+  deeptutor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        # Pass backend port at build time for Next.js static optimization
+        - BACKEND_PORT=${BACKEND_PORT:-8001}
+    container_name: deeptutor
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8001}:${BACKEND_PORT:-8001}"
+      - "${FRONTEND_PORT:-3782}:${FRONTEND_PORT:-3782}"
+
+    # Load environment variables from .env file
+    env_file:
+      - .env
+
+    environment:
+      # LLM Configuration (Required)
+      - LLM_BINDING=${LLM_BINDING:-openai}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_HOST=${LLM_HOST}
+      - LLM_API_VERSION=${LLM_API_VERSION:-}
+      - DISABLE_SSL_VERIFY=${DISABLE_SSL_VERIFY:-false}
+      # Embedding Configuration (Required for Knowledge Base)
+      - EMBEDDING_BINDING=${EMBEDDING_BINDING:-openai}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - EMBEDDING_HOST=${EMBEDDING_HOST}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-3072}
+      - EMBEDDING_API_VERSION=${EMBEDDING_API_VERSION:-}
+      # Web Search Configuration (Optional)
+      - SEARCH_PROVIDER=${SEARCH_PROVIDER:-}
+      - SEARCH_API_KEY=${SEARCH_API_KEY:-}
+      - SEARCH_BASE_URL=${SEARCH_BASE_URL:-}
+      # Service Ports Configuration
+      - BACKEND_PORT=${BACKEND_PORT:-8001}
+      - FRONTEND_PORT=${FRONTEND_PORT:-3782}
+      # API URL Configuration (Important for Remote Deployment)
+      - NEXT_PUBLIC_API_BASE_EXTERNAL=${NEXT_PUBLIC_API_BASE_EXTERNAL:-}
+      - NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE:-}
+
+    volumes:
+      # Mount local data directory for persistence (read-write)
+      # This includes runtime settings under ./data/user/settings.
+      - ./data/user:/app/data/user
+      - ./data/knowledge_bases:/app/data/knowledge_bases
+      # ⭐ 关键！Bot 配置持久化（坑7根因修复）
+      # 没有这个卷，每次 down && up 后 Bot 配置、SOUL.md 等全部丢失
+      - ./data/tutorbot:/app/data/tutorbot
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${BACKEND_PORT:-8001}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    networks:
+      - deeptutor-network
+
+networks:
+  deeptutor-network:
+    driver: bridge
