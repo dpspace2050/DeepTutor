@@ -302,6 +302,9 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        consecutive_same_tool: int = 0
+        last_tool_name: str | None = None
+        MAX_CONSECUTIVE_SAME_TOOL: int = 3  # 防止单工具死循环（如 code_execution 无限重试）
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -333,6 +336,25 @@ class AgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
+
+                    # Anti-loop: detect consecutive calls to the same tool
+                    if tool_call.name == last_tool_name:
+                        consecutive_same_tool += 1
+                    else:
+                        consecutive_same_tool = 1
+                        last_tool_name = tool_call.name
+
+                    if consecutive_same_tool >= MAX_CONSECUTIVE_SAME_TOOL:
+                        logger.warning(
+                            'Same tool (%s) called %d times consecutively — forcing stop',
+                            tool_call.name, consecutive_same_tool,
+                        )
+                        final_content = (
+                            f'我注意到我在重复使用 {tool_call.name} 工具（已连续 {consecutive_same_tool} 次），'
+                            ' 这表明当前方法可能不适用。让我换一种方式来分析这道题。'
+                        )
+                        break
+
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
@@ -340,6 +362,9 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
+                # Reset anti-loop counters on normal response path
+                consecutive_same_tool = 0
+                last_tool_name = None
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
