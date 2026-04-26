@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import re
 import sys
-from typing import TYPE_CHECKING, Awaitable, Callable
+from contextlib import AsyncExitStack
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
 from deeptutor.tutorbot.agent.context import ContextBuilder
 from deeptutor.tutorbot.agent.memory import MemoryConsolidator
-from deeptutor.tutorbot.agent.subagent import SubagentManager
 from deeptutor.tutorbot.agent.team import TeamManager
 from deeptutor.tutorbot.agent.team.tools import TeamTool
+from deeptutor.tutorbot.agent.subagent import SubagentManager
 from deeptutor.tutorbot.agent.tools.cron import CronTool
 from deeptutor.tutorbot.agent.tools.message import MessageTool
 from deeptutor.tutorbot.agent.tools.registry import ToolRegistry, build_base_tools
@@ -156,14 +156,9 @@ class AgentLoop:
             RAGAdapterTool,
             ReasonAdapterTool,
         )
-
-        for tool_cls in (
-            BrainstormAdapterTool,
-            RAGAdapterTool,
-            CodeExecutionAdapterTool,
-            ReasonAdapterTool,
-            PaperSearchAdapterTool,
-        ):
+        for tool_cls in (BrainstormAdapterTool, RAGAdapterTool,
+                         CodeExecutionAdapterTool, ReasonAdapterTool,
+                         PaperSearchAdapterTool):
             self.tools.register(tool_cls())
 
     async def _connect_mcp(self) -> None:
@@ -172,7 +167,6 @@ class AgentLoop:
             return
         self._mcp_connecting = True
         from deeptutor.tutorbot.agent.tools.mcp import connect_mcp_servers
-
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
@@ -183,8 +177,8 @@ class AgentLoop:
             if self._mcp_stack:
                 try:
                     await self._mcp_stack.aclose()
-                except Exception as close_error:
-                    logger.debug("Failed to close MCP stack cleanly: {}", close_error)
+                except Exception:
+                    pass
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
@@ -202,18 +196,100 @@ class AgentLoop:
         if not text:
             return None
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+    # Characters that commonly appear in garbled math output (vertical stacking)
+    _MATH_CHAR_RE = re.compile(
+        r"^[\s\d\w\u0370-\u03FF\u2100-\u214F"
+        r"\u2190-\u21FF\u2200-\u22FF"
+        r"\u2300-\u23FF\u2500-\u257F"
+        r"\u25A0-\u25FF\u2600-\u26FF"
+        r"\u27C0-\u27EF\u2900-\u297F"
+        r"\u2980-\u29FF\u2A00-\u2AFF"
+        r"\u2B00-\u2BFF\U0001D400-\U0001D7FF"
+        r"=+\-*/(){}\[\]<>^_~.,;:!?|\\]+$",
+        re.UNICODE,
+    )
+    # LaTeX command pattern (commands starting with backslash + letters)
+    _LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+")
+
+    @staticmethod
+    def _clean_garbled_math(text: str | None) -> str | None:
+        """Fix common LLM math-output corruption.
+
+        Handles two patterns seen in the wild:
+
+        **Pattern 1 – vertical stacking**: The model emits each math symbol on its own
+        line (e.g. ``∠`` / ``C`` / ``B`` / ``D`` / ``=`` / ``∠`` / ``A`` / …).  We detect
+        runs of ≥3 consecutive short lines (≤5 chars) that consist *only* of math-like
+        characters and join them into a single line.
+
+        **Pattern 2 – orphaned LaTeX**: Lines that contain LaTeX commands (``\\angle``,
+        ``\\frac``, …) but are **not** already wrapped in ``$$…$$`` / ``$…$`` delimiters.
+        We wrap such lines in inline-math delimiters so the downstream renderer can
+        process them.
+        """
+        if not text:
+            return None
+
+        lines = text.split("\n")
+        cleaned: list[str] = []
+        i = 0
+
+        while i < len(lines):
+            raw = lines[i]
+
+            # --- Pattern 1: Detect & collapse vertically-stacked math lines ---
+            run_start = i
+            run_len = 0
+            while (
+                i < len(lines)
+                and len(lines[i].strip()) <= 5
+                and AgentLoop._MATH_CHAR_RE.match(lines[i].strip())
+            ):
+                run_len += 1
+                i += 1
+
+            if run_len >= 3:
+                # Join the stacked symbols into one line
+                joined = "".join(lines[j].strip() for j in range(run_start, i))
+                cleaned.append(joined)
+                continue
+
+            # --- Pattern 2: Wrap orphaned LaTeX in $...$ ---
+            stripped = raw.strip()
+            has_latex = bool(AgentLoop._LATEX_CMD_RE.search(stripped))
+            if has_latex and "$$" not in stripped and "$" not in stripped:
+                cleaned.append(f"${stripped}$")
+                i += 1
+                continue
+
+            cleaned.append(raw)
+            i += 1
+
+        result = "\n".join(cleaned)
+
+        # Final safety pass: fold isolated single-char math symbol lines
+        final_lines: list[str] = []
+        for line in result.split("\n"):
+            if (
+                len(line.strip()) == 1
+                and AgentLoop._MATH_CHAR_RE.match(line.strip())
+                and final_lines
+            ):
+                final_lines[-1] = final_lines[-1].rstrip() + line.strip()
+            else:
+                final_lines.append(line)
+
+        return "\n".join(final_lines).strip() or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
-
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
-
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     async def _run_agent_loop(
@@ -245,11 +321,12 @@ class AgentLoop:
                         await on_progress(thought)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
 
-                tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
+                tool_call_dicts = [
+                    tc.to_openai_tool_call()
+                    for tc in response.tool_calls
+                ]
                 messages = self.context.add_assistant_message(
-                    messages,
-                    response.content,
-                    tool_call_dicts,
+                    messages, response.content, tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -271,12 +348,10 @@ class AgentLoop:
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
-                    messages,
-                    clean,
-                    reasoning_content=response.reasoning_content,
+                    messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
-                final_content = clean
+                final_content = self._clean_garbled_math(clean)
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -311,16 +386,7 @@ class AgentLoop:
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
-
-                def _cleanup_task(
-                    done_task: asyncio.Task[None],
-                    session_key: str = msg.session_key,
-                ) -> None:
-                    session_tasks = self._active_tasks.get(session_key, [])
-                    if done_task in session_tasks:
-                        session_tasks.remove(done_task)
-
-                task.add_done_callback(_cleanup_task)
+                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -339,28 +405,20 @@ class AgentLoop:
             self.sessions.save(session)
         total = cancelled + sub_cancelled + team_cancelled
         content = f"Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=content,
-            )
-        )
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
 
     async def _handle_restart(self, msg: InboundMessage) -> None:
         """Restart the process in-place via os.execv."""
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="Restarting...",
-            )
-        )
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
+        ))
 
         async def _do_restart():
             await asyncio.sleep(1)
             # Use original sys.argv to preserve entry point (tutorbot runs in-process)
-            os.execv(sys.executable, [sys.executable] + sys.argv)  # nosec B606
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
         asyncio.create_task(_do_restart())
 
@@ -372,26 +430,19 @@ class AgentLoop:
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
-                    await self.bus.publish_outbound(
-                        OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content="",
-                            metadata=msg.metadata or {},
-                        )
-                    )
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="", metadata=msg.metadata or {},
+                    ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    )
-                )
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Sorry, I encountered an error.",
+                ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
@@ -416,9 +467,8 @@ class AgentLoop:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
-            channel, chat_id = (
-                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
-            )
+            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
+                                else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
@@ -427,19 +477,14 @@ class AgentLoop:
             history = session.get_history(max_messages=0)
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content,
-                channel=channel,
-                chat_id=chat_id,
+                current_message=msg.content, channel=channel, chat_id=chat_id,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=final_content or "Background task completed.",
-            )
+            return OutboundMessage(channel=channel, chat_id=chat_id,
+                                  content=final_content or "Background task completed.")
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -470,9 +515,8 @@ class AgentLoop:
             session.metadata.pop("nano_team_active", None)
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content="New session started."
-            )
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="New session started.")
         if cmd == "/help":
             lines = [
                 "🐈 TutorBot commands:",
@@ -490,9 +534,7 @@ class AgentLoop:
                 "/help — Show available commands",
             ]
             return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="\n".join(lines),
+                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
         current_message = msg.content
         if cmd.startswith("/btw"):
@@ -613,9 +655,7 @@ class AgentLoop:
                 return OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
-                    content=self.team.request_changes_for_session(
-                        key, task_id, instruction_text.strip()
-                    ),
+                    content=self.team.request_changes_for_session(key, task_id, instruction_text.strip()),
                     metadata={"team_text": True},
                 )
 
@@ -665,26 +705,19 @@ class AgentLoop:
             history=history,
             current_message=current_message,
             media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+            channel=msg.channel, chat_id=msg.chat_id,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+            ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
+            initial_messages, on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:
@@ -700,9 +733,7 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=final_content,
+            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
 
@@ -713,16 +744,10 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            if (
-                role == "tool"
-                and isinstance(content, str)
-                and len(content) > self._TOOL_RESULT_MAX_CHARS
-            ):
-                entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
+                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
-                if isinstance(content, str) and content.startswith(
-                    ContextBuilder._RUNTIME_CONTEXT_TAG
-                ):
+                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)
                     if len(parts) > 1 and parts[1].strip():
@@ -732,15 +757,10 @@ class AgentLoop:
                 if isinstance(content, list):
                     filtered = []
                     for c in content:
-                        if (
-                            c.get("type") == "text"
-                            and isinstance(c.get("text"), str)
-                            and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
-                        ):
+                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                             continue  # Strip runtime context from multimodal messages
-                        if c.get("type") == "image_url" and c.get("image_url", {}).get(
-                            "url", ""
-                        ).startswith("data:image/"):
+                        if (c.get("type") == "image_url"
+                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
                             filtered.append({"type": "text", "text": "[image]"})
                         else:
                             filtered.append(c)
@@ -758,11 +778,10 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        media: list | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress
-        )
+        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""
