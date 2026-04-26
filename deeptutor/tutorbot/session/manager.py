@@ -1,10 +1,10 @@
 """Session management for conversation history."""
 
+import json
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
-import json
 from pathlib import Path
-import shutil
 from typing import Any
 
 from loguru import logger
@@ -34,13 +34,18 @@ class Session:
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
-        msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
+        msg = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+            **kwargs
+        }
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a user turn."""
-        unconsolidated = self.messages[self.last_consolidated :]
+        unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid orphaned tool_result blocks
@@ -139,11 +144,7 @@ class SessionManager:
 
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
-                        created_at = (
-                            datetime.fromisoformat(data["created_at"])
-                            if data.get("created_at")
-                            else None
-                        )
+                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
@@ -153,7 +154,7 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated,
+                last_consolidated=last_consolidated
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -170,17 +171,182 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated,
+                "last_consolidated": session.last_consolidated
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+        # Auto-update index for bot web sessions
+        parts = session.key.split(":")
+        if len(parts) == 4 and parts[0] == "bot" and parts[2] == "web":
+            # key format: bot:{bot_id}:web:{session_id}
+            bot_id = parts[1]
+            sid = parts[3]
+            index = self._load_index()
+            if session.key in index:
+                index[session.key]["updated_at"] = session.updated_at.isoformat()
+                index[session.key]["message_count"] = len(session.messages)
+                self._save_index(index)
 
         self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+
+    # --- Bot multi-session index (sessions_index.json) ---
+
+    def _get_index_path(self) -> Path:
+        """Get path to sessions index file."""
+        return self.sessions_dir / "sessions_index.json"
+
+    def _load_index(self) -> dict[str, Any]:
+        """Load session metadata index from disk."""
+        path = self._get_index_path()
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_index(self, index: dict[str, Any]) -> None:
+        """Save session metadata index to disk."""
+        path = self._get_index_path()
+        ensure_dir(path.parent)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+
+    # --- Bot session CRUD ---
+
+    def list_bot_sessions(self, bot_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """List all web sessions for a specific bot, sorted by updated_at desc.
+
+        Includes legacy (pre-multi-session) JSONL files as a 'default' entry
+        so old chat history is not lost.
+        """
+        prefix = f"bot:{bot_id}:web:"
+        legacy_key = f"bot:{bot_id}"
+        legacy_session_id = "default"
+        index = self._load_index()
+        result = []
+
+        # --- New-format sessions from index ---
+        for key, meta in index.items():
+            if key.startswith(prefix):
+                result.append({
+                    "session_id": key[len(prefix):],
+                    "title": meta.get("title", "New Chat"),
+                    "created_at": meta.get("created_at", ""),
+                    "updated_at": meta.get("updated_at", ""),
+                    "message_count": meta.get("message_count", 0),
+                })
+
+        # --- Legacy session (old format bot:{bot_id}.jsonl) ---
+        legacy_path = self._get_session_path(legacy_key)
+        if legacy_path.exists() and legacy_key not in index:
+            # Count messages (skip metadata line)
+            msg_count = 0
+            try:
+                with open(legacy_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        if data.get("_type") != "metadata":
+                            msg_count += 1
+            except Exception:
+                pass
+
+            # Get timestamps from metadata line
+            created_at = ""
+            updated_at = ""
+            try:
+                with open(legacy_path, encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                    if first_line:
+                        data = json.loads(first_line)
+                        if data.get("_type") == "metadata":
+                            created_at = data.get("created_at", "")
+                            updated_at = data.get("updated_at", "")
+            except Exception:
+                pass
+
+            result.append({
+                "session_id": legacy_session_id,
+                "title": "Default Chat",
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "message_count": msg_count,
+                "_is_legacy": True,
+            })
+
+        result.sort(key=lambda x: x["updated_at"], reverse=True)
+        return result[:limit]
+
+    def create_bot_session(self, bot_id: str, session_id: str, title: str | None = None) -> Session:
+        """Create a new empty session for a bot's web chat."""
+        key = f"bot:{bot_id}:web:{session_id}"
+        session = Session(key=key)
+        now = datetime.now().isoformat()
+
+        # Write empty JSONL so it appears on disk
+        self.save(session)
+
+        # Update index
+        index = self._load_index()
+        index[key] = {
+            "title": title or "New Chat",
+            "created_at": now,
+            "updated_at": now,
+            "message_count": 0,
+        }
+        self._save_index(index)
+
+        return session
+
+    def rename_bot_session(self, bot_id: str, session_id: str, title: str) -> bool:
+        """Rename a bot session (updates index only)."""
+        key = f"bot:{bot_id}:web:{session_id}"
+        index = self._load_index()
+        if key not in index:
+            return False
+        index[key]["title"] = title
+        index[key]["updated_at"] = datetime.now().isoformat()
+        self._save_index(index)
+        return True
+
+    def delete_bot_session(self, bot_id: str, session_id: str) -> bool:
+        """Delete a bot session: remove from cache, delete JSONL, remove from index."""
+        key = f"bot:{bot_id}:web:{session_id}"
+
+        # Remove from cache
+        self.invalidate(key)
+
+        # Delete JSONL file
+        path = self._get_session_path(key)
+        if path.exists():
+            path.unlink()
+
+        # Remove from index
+        index = self._load_index()
+        if key in index:
+            del index[key]
+            self._save_index(index)
+            return True
+        return False
+
+    def update_session_stats(self, bot_id: str, session_id: str, delta: int = 1) -> None:
+        """Update message count and updated_at timestamp in index."""
+        key = f"bot:{bot_id}:web:{session_id}"
+        index = self._load_index()
+        if key in index:
+            index[key]["message_count"] = index[key].get("message_count", 0) + delta
+            index[key]["updated_at"] = datetime.now().isoformat()
+            self._save_index(index)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
@@ -200,14 +366,12 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append(
-                                {
-                                    "key": key,
-                                    "created_at": data.get("created_at"),
-                                    "updated_at": data.get("updated_at"),
-                                    "path": str(path),
-                                }
-                            )
+                            sessions.append({
+                                "key": key,
+                                "created_at": data.get("created_at"),
+                                "updated_at": data.get("updated_at"),
+                                "path": str(path)
+                            })
             except Exception:
                 continue
 

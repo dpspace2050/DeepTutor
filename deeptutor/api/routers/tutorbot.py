@@ -4,7 +4,6 @@ TutorBot management API.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 
@@ -20,24 +19,6 @@ from deeptutor.services.tutorbot.manager import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-# Per-bot async locks used to dedupe concurrent WebSocket-driven auto-starts.
-# `manager.start_bot` already short-circuits when the bot is already running,
-# but that check is not async-safe: two coroutines that both observe a stopped
-# bot will each run the full start sequence. Serializing on a per-bot lock
-# avoids the duplicated work and noisy logs.
-_start_locks: dict[str, asyncio.Lock] = {}
-_start_locks_mutex = asyncio.Lock()
-
-
-async def _get_start_lock(bot_id: str) -> asyncio.Lock:
-    async with _start_locks_mutex:
-        lock = _start_locks.get(bot_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _start_locks[bot_id] = lock
-        return lock
 
 
 class CreateBotRequest(BaseModel):
@@ -72,8 +53,15 @@ class SoulUpdateRequest(BaseModel):
     content: str | None = None
 
 
-# ── Soul template library (must be before /{bot_id} routes) ───
+class CreateBotSessionRequest(BaseModel):
+    title: str | None = None
 
+
+class RenameBotSessionRequest(BaseModel):
+    title: str
+
+
+# ── Soul template library (must be before /{bot_id} routes) ───
 
 @router.get("/souls")
 async def list_souls():
@@ -112,7 +100,6 @@ async def delete_soul(soul_id: str):
 
 
 # ── Bot management (static paths before /{bot_id} parameterized routes) ──
-
 
 @router.get("")
 async def list_bots():
@@ -317,7 +304,6 @@ async def update_bot(bot_id: str, payload: UpdateBotRequest):
 
 # ── Workspace file endpoints ──────────────────────────────────
 
-
 @router.get("/{bot_id}/files")
 async def list_bot_files(bot_id: str):
     return get_tutorbot_manager().read_all_bot_files(bot_id)
@@ -339,158 +325,199 @@ async def write_bot_file(bot_id: str, filename: str, payload: FileUpdateRequest)
     return {"filename": filename, "saved": True}
 
 
+# ── Bot Session Management ────────────────────────────────────
+
+@router.get("/{bot_id}/sessions")
+async def list_bot_sessions(bot_id: str, limit: int = 50):
+    """List all web chat sessions for a bot."""
+    mgr = get_tutorbot_manager()
+    sm = mgr.get_session_manager(bot_id)
+    if not sm:
+        raise HTTPException(status_code=404, detail="Bot session manager not found")
+    return sm.list_bot_sessions(bot_id, limit=limit)
+
+
+@router.post("/{bot_id}/sessions")
+async def create_bot_session(bot_id: str, payload: CreateBotSessionRequest):
+    """Create a new web chat session for a bot."""
+    import uuid
+    session_id = str(uuid.uuid4())
+    mgr = get_tutorbot_manager()
+    sm = mgr.get_session_manager(bot_id)
+    if not sm:
+        raise HTTPException(status_code=404, detail="Bot session manager not found")
+    session = sm.create_bot_session(bot_id, session_id, title=payload.title)
+    return {"session_id": session_id, "title": payload.title or "New Chat"}
+
+
+@router.patch("/{bot_id}/sessions/{session_id}")
+async def rename_bot_session(bot_id: str, session_id: str, payload: RenameBotSessionRequest):
+    """Rename a bot session."""
+    mgr = get_tutorbot_manager()
+    sm = mgr.get_session_manager(bot_id)
+    if not sm:
+        raise HTTPException(status_code=404, detail="Bot session manager not found")
+    ok = sm.rename_bot_session(bot_id, session_id, payload.title)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session_id, "title": payload.title}
+
+
+@router.delete("/{bot_id}/sessions/{session_id}")
+async def delete_bot_session(bot_id: str, session_id: str):
+    """Delete a bot session and its messages."""
+    mgr = get_tutorbot_manager()
+    sm = mgr.get_session_manager(bot_id)
+    if not sm:
+        raise HTTPException(status_code=404, detail="Bot session manager not found")
+    ok = sm.delete_bot_session(bot_id, session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session_id, "deleted": True}
+
+
 # ── Chat history & WebSocket ──────────────────────────────────
 
-
 @router.get("/{bot_id}/history")
-async def get_bot_history(bot_id: str, limit: int = 100):
-    """Read chat history from the bot's per-bot JSONL session files."""
+async def get_bot_history(
+    bot_id: str,
+    limit: int = 100,
+    session_id: str | None = Query(None, description="Filter by specific session ID"),
+):
+    """Read chat history from the bot's per-bot JSONL session files.
+
+    When session_id is provided, returns only that session's messages.
+    Otherwise returns merged history from all sessions (backward compatible).
+    """
+    if session_id:
+        mgr = get_tutorbot_manager()
+        sm = mgr.get_session_manager(bot_id)
+        if not sm:
+            return []
+        # Map "default" to legacy key format for backward compatibility
+        if session_id == "default":
+            key = f"bot:{bot_id}"
+        else:
+            key = f"bot:{bot_id}:web:{session_id}"
+        session = sm._load(key)
+        if not session:
+            return []
+        return session.get_history(max_messages=limit)
     return get_tutorbot_manager().get_bot_history(bot_id, limit=limit)
 
 
 @router.websocket("/{bot_id}/ws")
-async def bot_chat_ws(ws: WebSocket, bot_id: str):
-    # `disconnected` is the single source of truth for "client is gone".
-    # Both task loops watch it so they can exit cooperatively without
-    # raising exceptions back into manager code (which has broad
-    # `except Exception:` handlers that would swallow them).
-    disconnected = asyncio.Event()
-
-    async def _safe_send(payload: dict) -> bool:
-        try:
-            await ws.send_json(payload)
-            return True
-        except (WebSocketDisconnect, RuntimeError):
-            disconnected.set()
-            return False
+async def bot_chat_ws(ws: WebSocket, bot_id: str, session_id: str | None = Query(None)):
+    import asyncio
+    import base64
+    import tempfile
+    import os
 
     mgr = get_tutorbot_manager()
     instance = mgr.get_bot(bot_id)
+    if not instance or not instance.running:
+        await ws.close(code=4004, reason="Bot not found or not running")
+        return
 
     await ws.accept()
-
-    if not instance or not instance.running:
-        config = mgr.load_bot_config(bot_id)
-        if config is None:
-            await _safe_send({"type": "error", "content": "Bot not found"})
-            await ws.close(code=4004, reason="Bot not found")
-            return
-        # Serialize concurrent starts of the same bot so only one
-        # WebSocket connection actually triggers `start_bot`; the rest
-        # observe the now-running instance and reuse it.
-        lock = await _get_start_lock(bot_id)
-        async with lock:
-            instance = mgr.get_bot(bot_id)
-            if not instance or not instance.running:
-                try:
-                    instance = await mgr.start_bot(bot_id, config)
-                except Exception:
-                    logger.exception("Failed to auto-start bot '%s' for websocket", bot_id)
-                    await _safe_send({"type": "error", "content": "Failed to start bot"})
-                    await ws.close(code=1011, reason="Failed to start bot")
-                    return
-
     logger.info("WebSocket connected for bot '%s'", bot_id)
 
     async def _handle_user_messages():
-        while not disconnected.is_set():
-            try:
-                raw = await ws.receive_text()
-            except WebSocketDisconnect:
-                disconnected.set()
-                break
+        while True:
+            raw = await ws.receive_text()
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                if not await _safe_send({"type": "error", "content": "Invalid JSON"}):
-                    break
+                await ws.send_json({"type": "error", "content": "Invalid JSON"})
                 continue
 
             content = data.get("content", "").strip()
+            if not content:
+                # Allow image-only messages (no text, just a photo)
+                attachments = data.get("attachments") or []
+                if not attachments:
+                    continue
+                content = "[Image] 请看这张图片"  # Default prompt for image-only messages
 
-            # Extract image attachments from the WebSocket message.
-            # The frontend (custom BotChatPage) sends: {content, attachments:[{type,base64,filename}]}
-            media: list[str] | None = None
-            raw_attachments = data.get("attachments") or []
-            if isinstance(raw_attachments, list) and raw_attachments:
-                media = []
-                for att in raw_attachments:
-                    if not isinstance(att, dict):
-                        continue
-                    b64 = att.get("base64", "")
-                    if b64 and att.get("type") == "image":
-                        media.append(b64)
-
-            if not content and not media:
-                continue
+            # ── Extract base64 attachments and save as temp files ──
+            media_paths: list[str] = []
+            attachments = data.get("attachments") or []
+            for att in attachments:
+                if not isinstance(att, dict):
+                    continue
+                b64_data = att.get("base64", "")
+                filename = att.get("filename", "image.png")
+                mime_type = att.get("type", "image/png")
+                if not b64_data:
+                    continue
+                # Strip data URL prefix if present (e.g., "data:image/png;base64,")
+                if "," in b64_data:
+                    b64_data = b64_data.split(",", 1)[1]
+                try:
+                    img_bytes = base64.b64decode(b64_data)
+                    # Determine extension from MIME type or filename
+                    ext = os.path.splitext(filename)[1] or ".png"
+                    if mime_type == "image/jpeg" or ext.lower() == ".jpg":
+                        ext = ".jpg"
+                    elif mime_type == "image/gif":
+                        ext = ".gif"
+                    elif mime_type == "image/webp":
+                        ext = ".webp"
+                    else:
+                        ext = ".png"
+                    # Write to temp file (cleaned up after processing)
+                    fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="dt_attach_")
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(img_bytes)
+                    media_paths.append(tmp_path)
+                    logger.debug("Saved attachment (%d bytes) -> %s", len(img_bytes), tmp_path)
+                except Exception:
+                    logger.exception("Failed to save attachment")
 
             async def on_progress(text: str) -> None:
-                # Best-effort: never raise. If the client is gone, just stop
-                # forwarding progress; the surrounding loop will notice the
-                # `disconnected` event and exit. Raising here would leak
-                # WebSocketDisconnect into `mgr.send_message`, which catches
-                # `Exception` broadly and would swallow the disconnect signal,
-                # leaving the bot to finish an expensive turn for nobody.
-                await _safe_send({"type": "thinking", "content": text})
+                await ws.send_json({"type": "thinking", "content": text})
 
             try:
                 response = await mgr.send_message(
-                    bot_id,
-                    content,
-                    chat_id=data.get("chat_id", "web"),
+                    bot_id, content, chat_id=session_id or data.get("chat_id", "web"),
                     on_progress=on_progress,
-                    media=media,
+                    media=media_paths if media_paths else None,
                 )
-                if not await _safe_send({"type": "content", "content": response}):
-                    break
-                if not await _safe_send({"type": "done"}):
-                    break
+                await ws.send_json({"type": "content", "content": response})
+                await ws.send_json({"type": "done"})
             except RuntimeError as exc:
-                if not await _safe_send({"type": "error", "content": str(exc)}):
-                    break
-            except WebSocketDisconnect:
-                disconnected.set()
-                break
+                await ws.send_json({"type": "error", "content": str(exc)})
             except Exception:
                 logger.exception("Error processing message for bot '%s'", bot_id)
-                if not await _safe_send({"type": "error", "content": "Internal error"}):
-                    break
+                await ws.send_json({"type": "error", "content": "Internal error"})
+            finally:
+                # Clean up temp files after processing
+                for p in media_paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
 
     async def _handle_notifications():
-        # Race the queue read against the disconnect signal so this loop
-        # cooperates with client disconnects detected by the other task.
-        while not disconnected.is_set():
-            get_task = asyncio.create_task(instance.notify_queue.get())
-            wait_task = asyncio.create_task(disconnected.wait())
-            done, pending = await asyncio.wait(
-                {get_task, wait_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-            if get_task not in done:
-                break
-            content = get_task.result()
-            if not await _safe_send({"type": "proactive", "content": content}):
+        while True:
+            content = await instance.notify_queue.get()
+            try:
+                await ws.send_json({"type": "proactive", "content": content})
+            except Exception:
                 break
 
     user_task = asyncio.create_task(_handle_user_messages())
     notify_task = asyncio.create_task(_handle_notifications())
     try:
         done, pending = await asyncio.wait(
-            [user_task, notify_task],
-            return_when=asyncio.FIRST_COMPLETED,
+            [user_task, notify_task], return_when=asyncio.FIRST_COMPLETED,
         )
-        disconnected.set()
         for t in pending:
             t.cancel()
         for t in done:
             if t.exception() and not isinstance(t.exception(), WebSocketDisconnect):
-                logger.exception(
-                    "WebSocket task error for bot '%s'", bot_id, exc_info=t.exception()
-                )
+                logger.exception("WebSocket task error for bot '%s'", bot_id, exc_info=t.exception())
     except Exception:
-        disconnected.set()
         user_task.cancel()
         notify_task.cancel()
     logger.info("WebSocket closed for bot '%s'", bot_id)
