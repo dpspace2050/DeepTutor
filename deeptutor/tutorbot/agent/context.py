@@ -202,14 +202,23 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         images = []
         for item in media:
-            p = Path(item)
             # --- Format 1: file path (existing behaviour) ---
-            if p.is_file():
-                raw = p.read_bytes()
-                mime = detect_image_mime(raw) or mimetypes.guess_type(item)[0]
-                if mime and mime.startswith("image/"):
-                    b64 = base64.b64encode(raw).decode()
-                    images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            # Guard: only treat as a path when it's short enough for os.stat().
+            # A raw base64 image can be 100KB+ which triggers "File name too long".
+            is_file_path = False
+            if len(item) < 260:  # MAX_PATH on Linux is typically 255-4096; use conservative threshold
+                try:
+                    p = Path(item)
+                    if p.is_file():
+                        is_file_path = True
+                        raw = p.read_bytes()
+                        mime = detect_image_mime(raw) or mimetypes.guess_type(item)[0]
+                        if mime and mime.startswith("image/"):
+                            b64 = base64.b64encode(raw).decode()
+                            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                except (OSError, ValueError):
+                    pass
+            if is_file_path:
                 continue
 
             # --- Format 2: raw base64 string (from WebSocket attachment) ---
