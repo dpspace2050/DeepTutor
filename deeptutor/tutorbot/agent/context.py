@@ -190,22 +190,43 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         ]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional base64-encoded images.
+
+        Supports two input formats for *media*:
+        1. File paths  – read from disk, auto-detect MIME (original behaviour).
+        2. Raw base64 – used by the WebSocket handler when the frontend sends
+           an inline image (paste / drag-drop / upload).
+        """
         if not media:
             return text
 
         images = []
-        for path in media:
-            p = Path(path)
-            if not p.is_file():
+        for item in media:
+            p = Path(item)
+            # --- Format 1: file path (existing behaviour) ---
+            if p.is_file():
+                raw = p.read_bytes()
+                mime = detect_image_mime(raw) or mimetypes.guess_type(item)[0]
+                if mime and mime.startswith("image/"):
+                    b64 = base64.b64encode(raw).decode()
+                    images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
                 continue
-            raw = p.read_bytes()
-            # Detect real MIME type from magic bytes; fallback to filename guess
-            mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or not mime.startswith("image/"):
+
+            # --- Format 2: raw base64 string (from WebSocket attachment) ---
+            # Heuristic: long enough to be plausible image data and looks like b64.
+            stripped = item.strip()
+            if len(stripped) < 100:
                 continue
-            b64 = base64.b64encode(raw).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            try:
+                # Quick sanity: decode round-trip must succeed.
+                decoded = base64.b64decode(stripped, validate=True)
+                if len(decoded) < 512:  # too small to be a real image
+                    continue
+            except Exception:
+                continue
+            # Detect MIME from decoded magic bytes.
+            mime = detect_image_mime(decoded) or "image/png"
+            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{stripped}"}})
 
         if not images:
             return text
