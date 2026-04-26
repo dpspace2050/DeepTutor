@@ -769,6 +769,7 @@ class TutorBotManager:
         content: str,
         chat_id: str = "web",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        media: list[str] | None = None,
     ) -> str:
         """Send a message to a running bot and return the response."""
         instance = self._bots.get(bot_id)
@@ -787,6 +788,7 @@ class TutorBotManager:
             channel="web",
             chat_id=chat_id,
             on_progress=_progress,
+            media=media,
         )
 
         # Forward the reply to any bound external channels so mobile users

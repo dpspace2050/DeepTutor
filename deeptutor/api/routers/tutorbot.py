@@ -407,7 +407,21 @@ async def bot_chat_ws(ws: WebSocket, bot_id: str):
                 continue
 
             content = data.get("content", "").strip()
-            if not content:
+
+            # Extract image attachments from the WebSocket message.
+            # The frontend (custom BotChatPage) sends: {content, attachments:[{type,base64,filename}]}
+            media: list[str] | None = None
+            raw_attachments = data.get("attachments") or []
+            if isinstance(raw_attachments, list) and raw_attachments:
+                media = []
+                for att in raw_attachments:
+                    if not isinstance(att, dict):
+                        continue
+                    b64 = att.get("base64", "")
+                    if b64 and att.get("type") == "image":
+                        media.append(b64)
+
+            if not content and not media:
                 continue
 
             async def on_progress(text: str) -> None:
@@ -425,6 +439,7 @@ async def bot_chat_ws(ws: WebSocket, bot_id: str):
                     content,
                     chat_id=data.get("chat_id", "web"),
                     on_progress=on_progress,
+                    media=media,
                 )
                 if not await _safe_send({"type": "content", "content": response}):
                     break
